@@ -26,8 +26,10 @@ from astrbot.core.star.star_manager import (
 )
 from astrbot.core.utils.astrbot_path import (
     get_astrbot_data_path,
+    get_astrbot_plugin_env_site_packages_path,
     get_astrbot_temp_path,
 )
+from astrbot.core import pip_installer
 
 from .route import Response, Route, RouteContext
 
@@ -390,6 +392,13 @@ class PluginRoute(Route):
             logo_url = None
             if plugin.logo_path:
                 logo_url = await self.get_plugin_logo_token(plugin.logo_path)
+            # 计算每插件依赖目录
+            dep_dir = None
+            if plugin.root_dir_name:
+                try:
+                    dep_dir = get_astrbot_plugin_env_site_packages_path(plugin.root_dir_name)
+                except Exception:
+                    dep_dir = None
             _t = {
                 "name": plugin.name,
                 "repo": "" if plugin.repo is None else plugin.repo,
@@ -407,6 +416,7 @@ class PluginRoute(Route):
                 "support_platforms": plugin.support_platforms,
                 "astrbot_version": plugin.astrbot_version,
                 "installed_at": self._get_plugin_installed_at(plugin),
+                "dependencies_site_packages": dep_dir,
             }
             # 检查是否为全空的幽灵插件
             if not any(
@@ -429,6 +439,16 @@ class PluginRoute(Route):
     async def get_failed_plugins(self):
         """专门获取加载失败的插件列表(字典格式)"""
         return Response().ok(self.plugin_manager.failed_plugin_dict).__dict__
+
+    async def get_install_log(self):
+        try:
+            name = request.args.get("name", "").strip()
+            if not name:
+                return Response().error("缺少插件名称").__dict__
+            logs = pip_installer.get_last_install_log(name)
+            return Response().ok({"name": name, "lines": logs or []}).__dict__
+        except Exception as e:
+            return Response().error(str(e)).__dict__
 
     async def get_plugin_handlers_info(self, handler_full_names: list[str]):
         """解析插件行为"""

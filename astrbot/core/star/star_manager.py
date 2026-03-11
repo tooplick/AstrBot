@@ -1,6 +1,7 @@
 """插件的重载、启停、安装、卸载等操作。"""
 
 import asyncio
+import importlib.metadata as importlib_metadata
 import functools
 import inspect
 import json
@@ -29,12 +30,15 @@ from astrbot.core.utils.astrbot_path import (
     get_astrbot_config_path,
     get_astrbot_path,
     get_astrbot_plugin_path,
+    get_astrbot_plugin_env_site_packages_path,
 )
 from astrbot.core.utils.io import remove_dir
 from astrbot.core.utils.metrics import Metric
+from astrbot.core.utils.runtime_env import is_packaged_desktop_runtime
 from astrbot.core.utils.requirements_utils import (
     RequirementsPrecheckFailed,
     find_missing_requirements_or_raise,
+    iter_requirements,
 )
 
 from . import StarMetadata
@@ -78,7 +82,63 @@ async def _install_requirements_with_precheck(
     *,
     plugin_label: str,
     requirements_path: str,
+    target_site_packages: str | None = None,
 ) -> None:
+    # 当启用了每插件 site-packages 时，优先以目标目录为准判断缺失，
+    # 确保即使全局环境满足，也会在插件专属目录中具备所需依赖（实现真正隔离）。
+    if target_site_packages:
+        # 收集 requirements 中的 (name, specifier)
+        required = list(iter_requirements(requirements_path=requirements_path))
+        if required:
+            installed: dict[str, str] = {}
+            try:
+                for dist in importlib_metadata.distributions(path=[target_site_packages]):
+                    name = (
+                        dist.metadata["Name"] if "Name" in dist.metadata else None
+                    )
+                    version = dist.version
+                    if name and version:
+                        installed[name.lower().replace("_", "-")] = version
+            except Exception:
+                # 读取失败则视为未安装，走安装分支
+                installed = {}
+
+            per_plugin_missing: set[str] = set()
+            for name, spec in required:
+                cur = installed.get(name)
+                if not cur:
+                    per_plugin_missing.add(name)
+                    continue
+                if spec and Version(cur) not in spec:
+                    per_plugin_missing.add(name)
+
+            if per_plugin_missing:
+                logger.info(
+                    f"检测到插件 {plugin_label} 在专属目录缺失依赖，准备安装到 {target_site_packages}: {sorted(per_plugin_missing)}"
+                )
+                await pip_installer.install(
+                    requirements_path=requirements_path,
+                    target_site_packages=target_site_packages,
+                    install_label=plugin_label,
+                )
+                return
+
+            # 目标目录已满足，仍需确保该目录在 sys.path 前置并优先使用其中依赖
+            logger.info(
+                f"插件 {plugin_label} 的依赖已满足（插件专属目录），跳过安装。"
+            )
+            try:
+                pip_installer.prefer_installed_dependencies(
+                    requirements_path=requirements_path,
+                    site_packages_path=target_site_packages,
+                )
+            except Exception as _pref_err:
+                logger.debug(
+                    f"为插件 {plugin_label} 前置依赖目录失败（不影响继续运行）: {_pref_err!s}"
+                )
+            return
+
+    # 未启用每插件目录，按全局预检查逻辑处理
     try:
         missing = find_missing_requirements_or_raise(requirements_path)
     except RequirementsPrecheckFailed:
@@ -86,7 +146,11 @@ async def _install_requirements_with_precheck(
             f"正在安装插件 {plugin_label} 的依赖库（预检查失败，回退到完整安装）: "
             f"{requirements_path}"
         )
-        await pip_installer.install(requirements_path=requirements_path)
+        await pip_installer.install(
+            requirements_path=requirements_path,
+            target_site_packages=target_site_packages,
+            install_label=plugin_label,
+        )
         return
 
     if not missing:
@@ -97,7 +161,11 @@ async def _install_requirements_with_precheck(
         f"检测到插件 {plugin_label} 缺失依赖，正在按 requirements.txt 安装: "
         f"{requirements_path} -> {sorted(missing)}"
     )
-    await pip_installer.install(requirements_path=requirements_path)
+    await pip_installer.install(
+        requirements_path=requirements_path,
+        target_site_packages=target_site_packages,
+        install_label=plugin_label,
+    )
 
 
 class PluginManager:
@@ -262,10 +330,19 @@ class PluginManager:
         if not os.path.exists(requirements_path):
             return
 
+        # 计算每插件 site-packages 目标目录（受灰度开关控制）
+        per_plugin = bool(self.config.get("plugin_env", {}).get("per_plugin_site_packages", True))
+        target_site_packages = None
+        if per_plugin:
+            target_site_packages = get_astrbot_plugin_env_site_packages_path(
+                os.path.basename(plugin_dir_path)
+            )
+
         try:
             await _install_requirements_with_precheck(
                 plugin_label=plugin_label,
                 requirements_path=requirements_path,
+                target_site_packages=target_site_packages,
             )
         except asyncio.CancelledError:
             raise
@@ -273,10 +350,15 @@ class PluginManager:
             logger.error(f"插件 {plugin_label} 依赖冲突: {e!s}")
             raise
         except Exception as e:
+            # 增加更友好的提示：首次创建目录与重试建议
+            friendly = (
+                f"依赖安装失败。已尝试创建目录 {target_site_packages or '<system site-packages>'} 并安装，"
+                f"请检查 requirements.txt 与网络/源配置，稍后在 WebUI 插件详情页查看安装日志并重试。"
+            )
             dependency_error = PluginDependencyInstallError(
                 plugin_label=plugin_label,
                 requirements_path=requirements_path,
-                error=e,
+                error=Exception(friendly + f" 原始错误: {e!s}"),
             )
             logger.exception(str(dependency_error))
             raise dependency_error from e
@@ -288,27 +370,64 @@ class PluginManager:
         root_dir_name: str,
         requirements_path: str,
     ) -> ModuleType:
+        """导入插件模块（requirements-only 路径）并在必要时尝试依赖恢复/安装。
+
+        行为说明：
+        - 首次直接 `__import__` 模块
+        - 失败且存在 requirements.txt 时，先尝试基于已安装依赖（data/site-packages 等）进行恢复
+        - 若恢复失败，则按 requirements.txt 执行安装后重试导入
+
+        注意：不改变现有依赖安装策略与目标目录，仅统一日志与提示语。
+        """
+        # 预先前置每插件 site-packages（若开启灰度开关且目录存在），
+        # 避免插件首次导入时内部模块的 import 早于“依赖恢复”步骤而失败。
+        if os.path.exists(requirements_path):
+            per_plugin = bool(self.config.get("plugin_env", {}).get("per_plugin_site_packages", True))
+            if per_plugin:
+                site_pkgs = get_astrbot_plugin_env_site_packages_path(root_dir_name)
+                try:
+                    pip_installer.prefer_installed_dependencies(
+                        requirements_path=requirements_path,
+                        site_packages_path=site_pkgs,
+                    )
+                except Exception as _pref_err:
+                    logger.debug(
+                        f"插件 {root_dir_name} 预先前置依赖目录失败（继续尝试导入）: {_pref_err!s}"
+                    )
+
         try:
+            logger.info(f"尝试导入插件模块: {path}")
             return __import__(path, fromlist=[module_str])
         except (ModuleNotFoundError, ImportError) as import_exc:
             if os.path.exists(requirements_path):
                 try:
                     logger.info(
-                        f"插件 {root_dir_name} 导入失败，尝试从已安装依赖恢复: {import_exc!s}"
+                        f"插件 {root_dir_name} 导入失败，尝试按已安装依赖恢复 (requirements: {requirements_path}): {import_exc!s}"
                     )
+                    # 在所有运行环境中优先使用每插件 site-packages（受灰度开关控制）
+                    site_pkgs = None
+                    per_plugin = bool(self.config.get("plugin_env", {}).get("per_plugin_site_packages", True))
+                    if per_plugin:
+                        site_pkgs = get_astrbot_plugin_env_site_packages_path(
+                            root_dir_name
+                        )
                     pip_installer.prefer_installed_dependencies(
-                        requirements_path=requirements_path
+                        requirements_path=requirements_path,
+                        site_packages_path=site_pkgs,
                     )
                     module = __import__(path, fromlist=[module_str])
                     logger.info(
-                        f"插件 {root_dir_name} 已从 site-packages 恢复依赖，跳过重新安装。"
+                        f"插件 {root_dir_name} 已从已安装依赖恢复成功（跳过安装）。"
                     )
                     return module
                 except Exception as recover_exc:
                     logger.info(
-                        f"插件 {root_dir_name} 已安装依赖恢复失败，将重新安装依赖: {recover_exc!s}"
+                        f"插件 {root_dir_name} 依赖恢复失败，将按 requirements.txt 安装后重试 (requirements: {requirements_path}): {recover_exc!s}"
                     )
 
+            logger.info(
+                f"开始安装插件依赖并重试导入: {root_dir_name} (requirements: {requirements_path})"
+            )
             await self._check_plugin_dept_update(target_plugin=root_dir_name)
             return __import__(path, fromlist=[module_str])
 
@@ -472,6 +591,36 @@ class PluginManager:
                 logger.info(f"清除了插件{dir_name}中的{key}模块")
                 del sys.modules[key]
 
+        # 额外清理：有些插件内部使用顶级包名（例如 iris_memory），
+        # 导致模块名不以 data.plugins.<dir_name> 开头。为避免缓存状态残留，
+        # 按文件路径归属到插件目录来清理相关模块。
+        try:
+            plugin_dir_path = os.path.join(self.plugin_store_path, dir_name)
+            plugin_dir_real = os.path.realpath(plugin_dir_path)
+            for key, mod in list(sys.modules.items()):
+                if not isinstance(mod, ModuleType):
+                    continue
+                mod_file = getattr(mod, "__file__", None)
+                if not mod_file:
+                    continue
+                try:
+                    mod_real = os.path.realpath(mod_file)
+                except Exception:
+                    continue
+                # 判断模块文件是否位于该插件目录内
+                try:
+                    common = os.path.commonpath([plugin_dir_real, mod_real])
+                except Exception:
+                    continue
+                if common == plugin_dir_real:
+                    try:
+                        del sys.modules[key]
+                        logger.info(f"清除了插件{dir_name}中的{key}模块(基于路径)")
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.debug(f"按路径清理插件模块失败({dir_name}): {e!s}")
+
         possible_paths = [
             f"{plugin_root_name}{dir_name}.main",
             f"{plugin_root_name}{dir_name}.{dir_name}",
@@ -499,11 +648,33 @@ class PluginManager:
         error: BaseException | str,
         error_trace: str,
     ) -> dict:
+        # 分类错误类型，便于在 WebUI/日志中更快定位
+        def _classify_error(err: BaseException | str) -> str:
+            try:
+                from astrbot.core import DependencyConflictError as _DepConflict
+            except Exception:
+                _DepConflict = tuple()  # type: ignore
+
+            if isinstance(err, PluginDependencyInstallError):
+                return "dependency_install_failed"
+            if isinstance(err, _DepConflict):
+                return "dependency_conflict"
+            if isinstance(err, PluginVersionIncompatibleError):
+                return "version_incompatible"
+            if isinstance(err, ModuleNotFoundError):
+                return "module_not_found"
+            if isinstance(err, ImportError):
+                return "import_error"
+            return "plugin_load_error"
+
+        error_type = _classify_error(error)
+
         record: dict = {
             "name": root_dir_name,
             "error": str(error),
             "traceback": error_trace,
             "reserved": reserved,
+            "error_type": error_type,
         }
         try:
             metadata = self._load_plugin_metadata(plugin_path=plugin_dir_path)
@@ -538,14 +709,25 @@ class PluginManager:
                 error = info.get("error", "未知错误")
                 display_name = info.get("display_name") or info.get("name") or dir_name
                 version = info.get("version") or info.get("astrbot_version")
+                error_type = info.get("error_type")
                 if version:
-                    lines.append(
-                        f"加载插件「{display_name}」(目录: {dir_name}, 版本: {version}) 时出现问题，原因：{error}。",
-                    )
+                    if error_type:
+                        lines.append(
+                            f"加载插件「{display_name}」(目录: {dir_name}, 版本: {version}) 出错[{error_type}]：{error}。",
+                        )
+                    else:
+                        lines.append(
+                            f"加载插件「{display_name}」(目录: {dir_name}, 版本: {version}) 时出现问题，原因：{error}。",
+                        )
                 else:
-                    lines.append(
-                        f"加载插件「{display_name}」(目录: {dir_name}) 时出现问题，原因：{error}。",
-                    )
+                    if error_type:
+                        lines.append(
+                            f"加载插件「{display_name}」(目录: {dir_name}) 出错[{error_type}]：{error}。",
+                        )
+                    else:
+                        lines.append(
+                            f"加载插件「{display_name}」(目录: {dir_name}) 时出现问题，原因：{error}。",
+                        )
             else:
                 error = str(info)
                 lines.append(f"加载插件目录 {dir_name} 时出现问题，原因：{error}。")

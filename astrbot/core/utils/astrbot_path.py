@@ -79,6 +79,35 @@ def get_astrbot_site_packages_path() -> str:
     return os.path.realpath(os.path.join(get_astrbot_data_path(), "site-packages"))
 
 
+# ------------------------------
+# 预留：每插件独立依赖目录（规划用，当前未启用）
+# ------------------------------
+
+def get_astrbot_plugins_envs_base_path() -> str:
+    """获取每插件依赖目录根路径（规划）。
+
+    当前实现未启用该目录，仅用于未来 OOP 模式/独立 site-packages 设计的路径规划与文档引用。
+    示例：data/plugins_envs/
+    """
+    return os.path.realpath(os.path.join(get_astrbot_data_path(), "plugins_envs"))
+
+
+def get_astrbot_plugin_env_site_packages_path(plugin_root_dir: str) -> str:
+    """获取指定插件的独立 site-packages（规划）。
+
+    Args:
+        plugin_root_dir: 插件目录名（即 data/plugins/<plugin_root_dir>）。
+
+    Returns:
+        形如 data/plugins_envs/<plugin_root_dir>/site-packages 的绝对路径。
+
+    注意：当前仅为规划函数，主流程仍使用全局 data/site-packages。
+    """
+    return os.path.realpath(
+        os.path.join(get_astrbot_plugins_envs_base_path(), plugin_root_dir, "site-packages")
+    )
+
+
 def get_astrbot_knowledge_base_path() -> str:
     """获取Astrbot知识库根目录路径"""
     return os.path.realpath(os.path.join(get_astrbot_data_path(), "knowledge_base"))

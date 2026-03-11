@@ -235,6 +235,14 @@ DEFAULT_CONFIG = {
     "trace_log_max_mb": 20,
     "pip_install_arg": "",
     "pypi_index_url": "https://mirrors.aliyun.com/pypi/simple/",
+    "plugin_env": {
+        # 最小灰度开关：是否启用每插件独立 site-packages 目录
+        # true: 安装与恢复均使用 data/plugins_envs/<plugin>/site-packages
+        # false: 复用旧行为（桌面打包使用 data/site-packages，服务器/容器走系统环境）
+        "per_plugin_site_packages": True,
+        # 预留：OOP 子进程模式灰度开关（未接入主流程）
+        "oop_enabled": False,
+    },
     "persona": [],  # deprecated
     "timezone": "Asia/Shanghai",
     "callback_api_base": "",

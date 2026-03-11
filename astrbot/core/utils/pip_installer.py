@@ -810,6 +810,8 @@ class PipInstaller:
         self.pypi_index_url = pypi_index_url
         self.core_dist_name = core_dist_name
         self._core_constraints = CoreConstraintsProvider(core_dist_name)
+        self._last_install_logs: dict[str, list[str]] = {}
+        self._capture_key: str | None = None
 
     def _build_pip_args(
         self,
@@ -817,6 +819,12 @@ class PipInstaller:
         requirements_path: str | None,
         mirror: str | None,
     ) -> tuple[list[str], set[str]]:
+        """构建 pip argv。
+
+        说明（requirements-only 路线）：
+        - AstrBot 插件安装流程仅走 requirements.txt 路径；`package_name` 入参保留兼容，但不会在插件管理链路中使用。
+        - 若未来接入 uv 或 per-plugin 目录，仅影响 argv 构建与目标目录，不改变此函数的输入输出契约。
+        """
         args: list[str] = []
         requested_requirements: set[str] = set()
         normalized_requirements_path = (
@@ -829,6 +837,8 @@ class PipInstaller:
             )
 
         if package_name:
+            # 兼容保留：在插件管理路径中不使用 package_name；如外部调用仍传入，按既有逻辑解析
+            # 若需强制禁用，可在此处改为警告并忽略。
             parsed_package = parse_package_install_input(package_name)
             if parsed_package.specs:
                 args = ["install", *parsed_package.specs]
@@ -863,7 +873,20 @@ class PipInstaller:
         package_name: str | None = None,
         requirements_path: str | None = None,
         mirror: str | None = None,
+        *,
+        target_site_packages: str | None = None,
+        install_label: str | None = None,
     ) -> None:
+        """安装依赖。
+
+        注意：AstrBot 插件依赖管理仅支持 requirements.txt 路径（requirements_path）。
+        package_name 参数仅为兼容保留，不在插件管理链路中使用。
+        """
+        if package_name and not requirements_path:
+            logger.warning(
+                "插件依赖安装仅支持 requirements.txt；收到 package_name=%r（兼容保留，非插件路径）",
+                package_name,
+            )
         args, requested_requirements = self._build_pip_args(
             package_name, requirements_path, mirror
         )
@@ -871,15 +894,21 @@ class PipInstaller:
             logger.info("Pip 包管理器跳过安装：未提供有效的包名或 requirements 文件。")
             return
 
-        target_site_packages = None
-        if is_packaged_desktop_runtime():
-            target_site_packages = get_astrbot_site_packages_path()
-            os.makedirs(target_site_packages, exist_ok=True)
-            _prepend_sys_path(target_site_packages)
+        # Decide installation target directory
+        install_target = None
+        if target_site_packages:
+            install_target = target_site_packages
+        elif is_packaged_desktop_runtime():
+            install_target = get_astrbot_site_packages_path()
+
+        if install_target:
+            os.makedirs(install_target, exist_ok=True)
+            # Prepend path to ensure installed modules can be located after install
+            _prepend_sys_path(install_target)
             args.extend(
                 [
                     "--target",
-                    target_site_packages,
+                    install_target,
                     "--upgrade",
                     "--upgrade-strategy",
                     "only-if-needed",
@@ -894,23 +923,32 @@ class PipInstaller:
                 "Pip 包管理器 argv: %s",
                 ["pip", *_redact_pip_args_for_logging(args)],
             )
-            await self._run_pip_with_classification(args)
+            key = install_label or (requirements_path or "<unknown>")
+            old_key = self._capture_key
+            try:
+                self._capture_key = key
+                await self._run_pip_with_classification(args)
+            finally:
+                self._capture_key = old_key
 
-        if target_site_packages:
-            _prepend_sys_path(target_site_packages)
+        if install_target:
+            _prepend_sys_path(install_target)
             _ensure_plugin_dependencies_preferred(
-                target_site_packages,
+                install_target,
                 requested_requirements,
             )
         importlib.invalidate_caches()
 
-    def prefer_installed_dependencies(self, requirements_path: str) -> None:
+    def prefer_installed_dependencies(
+        self, *, requirements_path: str, site_packages_path: str | None = None
+    ) -> None:
         """优先使用已安装在插件 site-packages 中的依赖，不执行安装。"""
-        if not is_packaged_desktop_runtime():
-            return
+        # Select target site-packages dir
+        target_site_packages = site_packages_path
+        if not target_site_packages and is_packaged_desktop_runtime():
+            target_site_packages = get_astrbot_site_packages_path()
 
-        target_site_packages = get_astrbot_site_packages_path()
-        if not os.path.isdir(target_site_packages):
+        if not target_site_packages or not os.path.isdir(target_site_packages):
             return
 
         requested_requirements = extract_requirement_names(requirements_path)
@@ -936,6 +974,13 @@ class PipInstaller:
         finally:
             _cleanup_added_root_handlers(original_handlers)
 
+        # cache last output lines for WebUI
+        if self._capture_key:
+            try:
+                self._last_install_logs[self._capture_key] = list(output_lines)[- _MAX_PIP_OUTPUT_LINES :]
+            except Exception:
+                pass
+
         if result_code != 0:
             conflict = _classify_pip_failure(output_lines)
             if conflict:
@@ -947,3 +992,6 @@ class PipInstaller:
         result_code = await self._run_pip_in_process(args)
         if result_code != 0:
             raise PipInstallError(f"安装失败，错误码：{result_code}", code=result_code)
+
+    def get_last_install_log(self, key: str) -> list[str] | None:
+        return self._last_install_logs.get(key)
